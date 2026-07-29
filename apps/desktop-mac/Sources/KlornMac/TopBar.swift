@@ -729,7 +729,7 @@ private struct RecentPushRow: View {
     let actions: TopBarActions
     @State private var hovering = false
 
-    private var sender: String { decodeHTMLEntities(item.email?.from ?? item.title) }
+    private var sender: String { senderDisplayName(item.email?.from.map(decodeHTMLEntities)) }
 
     var body: some View {
         HStack(spacing: Theme.s2) {
@@ -844,9 +844,17 @@ struct FullView: View {
         @Bindable var model = model
 
         ZStack {
+            // Sky behind everything. The header sits directly on it so the view
+            // opens on air rather than on a toolbar; the working columns get a
+            // translucent panel so running text never lands on a gradient.
+            AmbientBackdrop()
             VStack(spacing: 0) {
+                // Chrome floats directly on the sky, the way the reference's
+                // nav pill does — the window opens on air, not on a toolbar.
                 header
-                Divider().overlay(Theme.line).padding(.horizontal, 22)
+                // The working columns are one card lifted off that sky. The
+                // inset is the whole point: without a margin the panel is just
+                // an opaque page and the backdrop may as well not exist.
                 HStack(spacing: 0) {
                     FullSidebar(selected: $model.listMode, actions: actions).frame(width: 220)
                     Rectangle().fill(Theme.line).frame(width: 1)
@@ -854,6 +862,12 @@ struct FullView: View {
                     Rectangle().fill(Theme.line).frame(width: 1)
                     ReadingPane(actions: actions).frame(maxWidth: .infinity)
                 }
+                .background(Theme.panelGradient(opacity: 0.90))
+                .clipShape(RoundedRectangle(cornerRadius: 18))
+                .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Theme.line))
+                .shadow(color: Theme.panelShadow.opacity(0.5), radius: 20, y: 6)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 14)
             }
             .onAppear { model.presentTierGuideIfFirstRun() }
             if model.showPreferences {
@@ -914,7 +928,19 @@ struct FullView: View {
             .help(L("bar.close"))
             .accessibilityLabel(L("bar.close.a11y"))
         }
-        .padding(.horizontal, 22).frame(height: 64)
+        // Chrome carries its own light surface instead of sitting bare on the
+        // sky. Two reasons, and the accessibility one is the binding constraint:
+        // secondary labels are slate-500, which clears 4.5:1 on the near-white
+        // panel but not on the gradient's darker top, and a floating bar with
+        // its own ground is also what the reference does with its nav.
+        .padding(.horizontal, 18)
+        .frame(height: 48)
+        .background(Theme.panelGradient(opacity: 0.92), in: Capsule())
+        .overlay(Capsule().strokeBorder(Theme.line))
+        .shadow(color: Theme.panelShadow.opacity(0.35), radius: 14, y: 4)
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
+        .padding(.bottom, 12)
     }
 }
 
@@ -1038,7 +1064,14 @@ private struct FullSidebar: View {
             // Briefing + today + UPCOMING mirror the panel's TodayColumn (same
             // shared views, dogfood 2026-07-23); scrollable so a busy week never
             // pushes ACCOUNT off the sidebar.
-            ColumnHeader(title: L("section.todayShort")).padding(.horizontal, 20).padding(.top, 18).padding(.bottom, 6)
+            // Only label the section when it has something in it. An empty
+            // "TODAY" heading over 300pt of nothing reads as a broken pane, not
+            // as a calm one.
+            let hasToday = model.briefing != nil || (model.today?.total ?? 0) > 0
+            if hasToday {
+                ColumnHeader(title: L("section.todayShort"))
+                    .padding(.horizontal, 20).padding(.top, 18).padding(.bottom, 6)
+            }
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 8) {
                     if let briefing = model.briefing {
@@ -1057,8 +1090,8 @@ private struct FullSidebar: View {
                                     .font(.caption2).foregroundStyle(Theme.textDim)
                                     .padding(.horizontal, 20)
                             }
-                        } else {
-                            Text(model.today == nil ? L("bar.loading") : L("calendar.noEvents"))
+                        } else if model.today == nil {
+                            Text(L("bar.loading"))
                                 .font(.caption).foregroundStyle(Theme.textDim)
                                 .padding(.horizontal, 20)
                         }
@@ -1080,7 +1113,6 @@ private struct FullSidebar: View {
             }
             sidebarAction(L("guide.reopen"), dim: true) { model.showTierGuide = true }
             sidebarAction(L("prefs.title"), dim: true) { model.showPreferences = true }
-            sidebarAction(L("menu.quit"), dim: true) { actions.onQuit() }
         }
         .padding(.horizontal, 8).padding(.vertical, 18)
     }
@@ -1139,7 +1171,13 @@ private struct FullList: View {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").font(.caption).foregroundStyle(Theme.textDim)
                     .accessibilityHidden(true)
+                if Theme.isRenderingOffscreen {
+                    Text(L("mail.searchPlaceholder"))
+                        .font(.callout).foregroundStyle(Theme.textDim)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
                 TextField(L("mail.searchPlaceholder"), text: $query)
+                    .opacity(Theme.isRenderingOffscreen ? 0 : 1)
                     .textFieldStyle(.plain).font(.callout).foregroundStyle(Theme.text)
                     .focused($searchFocused)
                     .accessibilityLabel(L("mail.search.a11y"))
@@ -1470,7 +1508,10 @@ private struct SearchHitRow: View {
     let hit: EmailSearchItem
 
     private var selected: Bool { model.selectedItemId == hit.id }
-    private var sender: String { decodeHTMLEntities(hit.from ?? "(unknown sender)") }
+    private var sender: String {
+        let name = senderDisplayName(hit.from.map(decodeHTMLEntities))
+        return name.isEmpty ? L("mail.unknownSender") : name
+    }
     @State private var hovering = false
 
     var body: some View {
@@ -1518,14 +1559,29 @@ private struct SearchHitRow: View {
     }
 }
 
-private struct FullRow: View {
+/// Stand-in for a `Menu` while the offscreen renderer runs. Menus are
+/// AppKit-backed and ImageRenderer paints them as a "restricted" placeholder
+/// glyph, which would otherwise end up in the screenshots the landing page
+/// ships. Same size and chrome, no AppKit.
+private struct OffscreenMenuLabel: View {
+    let title: String
+    var body: some View {
+        (Text(title) + Text(Image(systemName: "chevron.down")))
+            .font(.caption2.weight(.semibold)).foregroundStyle(Theme.textDim)
+            .padding(.horizontal, 9).padding(.vertical, 4)
+            .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.line))
+    }
+}
+
+struct FullRow: View {
     @Environment(AppModel.self) private var model
     let item: FirewallItem
     let actions: TopBarActions
     @FocusState private var focused: Bool
 
     private var selected: Bool { model.selectedItemId == item.id }
-    private var sender: String { decodeHTMLEntities(item.email?.from ?? item.title) }
+    private var sender: String { senderDisplayName(item.email?.from.map(decodeHTMLEntities)) }
     @State private var hovering = false
 
     var body: some View {
@@ -1534,13 +1590,19 @@ private struct FullRow: View {
             // onTapGesture, so VoiceOver / Full-Keyboard-Access can open the message.
             Button { actions.onSelect(item) } label: {
                 HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(sender).font(.body.weight(.semibold))
+                    // Hierarchy by size contrast, not by three near-equal lines:
+                    // the sender is a small label and the subject is the
+                    // statement, because the subject is what you actually scan
+                    // a list for. The old row set them one point apart, which
+                    // reads as one grey block at arm's length.
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(sender).font(.caption.weight(.semibold))
+                            .foregroundStyle(Theme.textDim).lineLimit(1)
+                        Text(decodeHTMLEntities(item.email?.subject ?? item.title))
+                            .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(Theme.text).lineLimit(1)
-                        Text(decodeHTMLEntities(item.email?.subject ?? item.title)).font(.callout)
-                            .foregroundStyle(Theme.text.opacity(0.85)).lineLimit(1)
                         if let reason = rowTierReason(item.tierReason) {
-                            Text(reason).font(.caption).foregroundStyle(Theme.textDim).lineLimit(1)
+                            Text(reason).font(.caption2).foregroundStyle(Theme.textDim).lineLimit(1)
                         }
                     }
                     Spacer(minLength: 8)
@@ -1562,17 +1624,25 @@ private struct FullRow: View {
                 // area is the only variant that keeps the tint AND the menu.
                 ZStack {
                     Circle().fill(Theme.tint(item.tier)).frame(width: 8, height: 8)
-                    TierMenu(item: item, onSetTier: actions.onSetTier) {
-                        Color.clear.iconTarget()
+                    if !Theme.isRenderingOffscreen {
+                        TierMenu(item: item, onSetTier: actions.onSetTier) {
+                            Color.clear.iconTarget()
+                        }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                     }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 }
                 .help(L("mail.changeTier"))
                 .accessibilityLabel(L("mail.changeTier.a11y", sender, item.tier.label))
-                SnoozeMenu(item: item, onSnooze: actions.onSnooze) {
-                    Image(systemName: "moon.zzz").iconTarget()
+                Group {
+                    if Theme.isRenderingOffscreen {
+                        Image(systemName: "moon.zzz").iconTarget()
+                    } else {
+                        SnoozeMenu(item: item, onSnooze: actions.onSnooze) {
+                            Image(systemName: "moon.zzz").iconTarget()
+                        }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                    }
                 }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
                 .foregroundStyle(Theme.textDim).help(L("mail.snooze"))
                 .accessibilityLabel(L("mail.snooze.a11y", sender))
                 .opacity(hovering || selected || focused ? 1 : 0)
@@ -1582,7 +1652,7 @@ private struct FullRow: View {
                     .opacity(hovering || selected || focused ? 1 : 0)
             }
         }
-        .padding(.horizontal, 20).padding(.vertical, 12)
+        .padding(.horizontal, 20).padding(.vertical, 11)
         // Selection is not color-only: an accent leading bar + a stronger fill (both
         // perceivable), plus the .isSelected trait above.
         .background(alignment: .leading) {
@@ -1660,7 +1730,7 @@ private struct ReadingPane: View {
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(Theme.text).lineLimit(2)
                 HStack {
-                    Text(decodeHTMLEntities(email.from ?? ""))
+                    Text(senderDisplayName(email.from.map(decodeHTMLEntities)))
                         .font(.callout).foregroundStyle(Theme.textDim).lineLimit(1)
                     Spacer()
                     Text(Self.formatDate(email.date)).font(.caption).foregroundStyle(Theme.textDim)
@@ -1678,20 +1748,25 @@ private struct ReadingPane: View {
                         // separate Image in the label gets reordered to the
                         // leading edge by the menu button's label styling
                         // (screen-verified 0.4.80007: "∨ Snooze").
-                        SnoozeMenu(item: item, onSnooze: actions.onSnooze) {
-                            Text(L("mail.snoozePrefix"))
-                                + Text(Image(systemName: "chevron.down"))
-                                .font(.caption2.weight(.semibold)).foregroundStyle(Theme.textDim)
+                        if Theme.isRenderingOffscreen {
+                            OffscreenMenuLabel(title: L("mail.snoozePrefix"))
+                            OffscreenMenuLabel(title: L("mail.moveTo", item.tier.label))
+                        } else {
+                            SnoozeMenu(item: item, onSnooze: actions.onSnooze) {
+                                Text(L("mail.snoozePrefix"))
+                                    + Text(Image(systemName: "chevron.down"))
+                                    .font(.caption2.weight(.semibold)).foregroundStyle(Theme.textDim)
+                            }
+                            .menuStyle(.button).buttonStyle(.bordered).controlSize(.small)
+                            .menuIndicator(.hidden).fixedSize()
+                            TierMenu(item: item, onSetTier: actions.onSetTier) {
+                                Text(L("mail.moveTo", item.tier.label))
+                                    + Text(Image(systemName: "chevron.down"))
+                                    .font(.caption2.weight(.semibold)).foregroundStyle(Theme.textDim)
+                            }
+                            .menuStyle(.button).buttonStyle(.bordered).controlSize(.small)
+                            .menuIndicator(.hidden).fixedSize()
                         }
-                        .menuStyle(.button).buttonStyle(.bordered).controlSize(.small)
-                        .menuIndicator(.hidden).fixedSize()
-                        TierMenu(item: item, onSetTier: actions.onSetTier) {
-                            Text(L("mail.moveTo", item.tier.label))
-                                + Text(Image(systemName: "chevron.down"))
-                                .font(.caption2.weight(.semibold)).foregroundStyle(Theme.textDim)
-                        }
-                        .menuStyle(.button).buttonStyle(.bordered).controlSize(.small)
-                        .menuIndicator(.hidden).fixedSize()
                         Button(L("mail.dismiss")) { actions.onDismiss(item) }
                             .buttonStyle(.bordered).controlSize(.small)
                     }
@@ -1727,7 +1802,7 @@ private struct ReadingPane: View {
     private func replyComposer(_ item: FirewallItem) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(L("reading.replyTo", item.email?.from ?? ""))
+                Text(L("reading.replyTo", senderDisplayName(item.email?.from.map(decodeHTMLEntities))))
                     .font(.caption).foregroundStyle(Theme.textDim).lineLimit(1)
                 Spacer()
                 if model.isDrafting {
