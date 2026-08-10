@@ -167,6 +167,45 @@ final class AppModel {
         }
     }
 
+    /// Reconnect the PRIMARY Google account (full-scope /google/start consent
+    /// in the browser) — distinct from addAccount, which links a Pro-gated
+    /// SECOND account and cannot revive the primary token.
+    func reconnectPrimary() async {
+        guard !isLinkingAccount else { return }
+        isLinkingAccount = true
+        defer { isLinkingAccount = false }
+        linkAccountError = nil
+        switch await GoogleConnectFlow.start(api: api) {
+        case .success:
+            startReconnectWatch()
+        case .failure(.unauthorized):
+            signOut()
+        case .failure(.network):
+            linkAccountError = L("account.reconnect.failed")
+        }
+    }
+
+    /// Poll (5 s cadence, 3 min cap) until the PRIMARY row's needsReconnect
+    /// clears — a reconnect flips a flag, it never adds an inbox row, so
+    /// startLinkWatch's count-grew condition can never fire for it.
+    private func startReconnectWatch() {
+        linkWatchTask?.cancel()
+        linkWatchTask = Task { [weak self] in
+            for _ in 0..<36 {
+                try? await Task.sleep(for: .seconds(5))
+                guard let self, !Task.isCancelled else { return }
+                await self.refreshInboxes()
+                let primaryDead = self.inboxes.contains {
+                    $0.kind == "primary" && $0.needsReconnect
+                }
+                if !primaryDead {
+                    await self.loadQueue()
+                    return
+                }
+            }
+        }
+    }
+
     /// Poll the inbox list (5 s cadence, 3 min cap) until the link lands —
     /// then pull the merged queue right away. Cancelled on sign-out.
     private func startLinkWatch() {

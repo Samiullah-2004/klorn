@@ -467,6 +467,22 @@ func firewallPath(selected: String) -> String {
     return base + "?inbox=\(enc)"
 }
 
+/// Caption label for a non-EMAIL firewall item (which has no sender):
+/// currently only GitHub notifications reach the desktop board without an
+/// email context. nil = render no caption line at all. Pure for the harness.
+func sourceBadgeLabel(_ source: String) -> String? {
+    source == "GITHUB" ? L("source.github") : nil
+}
+
+/// Never-empty sender for a11y label strings ("Snooze message from %@") —
+/// a non-EMAIL item has no sender, and interpolating "" read as "Snooze
+/// message from" mid-sentence to VoiceOver. Pure for the harness.
+func a11ySenderLabel(_ item: FirewallItem) -> String {
+    let sender = senderDisplayName(item.email?.from.map(decodeHTMLEntities))
+    if !sender.isEmpty { return sender }
+    return sourceBadgeLabel(item.source) ?? L("source.unknown")
+}
+
 /// Full menu-row label for one inbox: the address, falling back by kind
 /// (mirrors the web selector's fallback copy). Pure.
 func inboxDisplayLabel(email: String?, kind: String) -> String {
