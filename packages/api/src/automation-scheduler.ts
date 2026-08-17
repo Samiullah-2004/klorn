@@ -10,7 +10,7 @@
  */
 
 import { drainActionOutbox } from "./agentcore/action-outbox.js";
-import { sendAutoReplyViaFloor } from "./agentcore/auto-reply-send.js";
+import { isSingleRecipient, sendAutoReplyViaFloor } from "./agentcore/auto-reply-send.js";
 import { runProactiveActions } from "./agentcore/proactive-actions.js";
 import { isEntitled, planHasFeature } from "./billing/stripe.js";
 import {
@@ -29,8 +29,13 @@ import { parseGoogleDateTime } from "./google-calendar-time.js";
 import { sweepAttentionAging } from "./judge/attention-aging.js";
 import { findOpenEmailAttentionItemId } from "./judge/attention-override.js";
 import { sweepFallbackRejudge } from "./judge/fallback-rejudge.js";
+import {
+  effectiveAutoReplyGuideline,
+  normalizeAttentionMode,
+} from "./learning/auto-reply-guideline.js";
 import { autoReplyEmailWhere } from "./mail/auto-reply-scope.js";
 import { syncRecentCandidateIntakes } from "./mail/email-candidate-intake.js";
+import { generateGuidelineReply } from "./mail/email-reply.js";
 import {
   backfillEmailAttentionItems,
   checkAutoReplyRules,
@@ -47,6 +52,7 @@ import { escalateUnackedPush } from "./notify/phone-escalation.js";
 import { sendPushNotification } from "./notify/push.js";
 import { sendSms } from "./notify/sms.js";
 import { buildUrgentDedupMessage, parseNotifiedGmailIds } from "./notify/urgent-dedup.js";
+import { autoModeSendEnabled, tierV2Enabled } from "./ops/feature-flags.js";
 import { createDailyBriefingDelivery } from "./pim/briefing.js";
 import { recordSchedulerTick, registerScheduler } from "./scheduler-heartbeat.js";
 import { captureError } from "./sentry.js";
@@ -512,6 +518,50 @@ export async function ensureAutoReplyNotification(
 }
 
 /**
+ * Auto-MODE reply ledger entry (ontology v2 — guideline-driven unattended
+ * replies, not EmailRule ones). Same winner-only atomic pattern as
+ * ensureAutoReplyNotification with its own dedupeKey namespace, so a mail can
+ * never receive both a rule reply alert and a mode reply alert twice; the two
+ * SEND paths themselves are mutually exclusive per email at the call site.
+ * Notification-free by design beyond the in-app bell: the founder contract
+ * says auto mode only interrupts for PUSH/MEETING, and an auto-handled reply
+ * is exactly the thing that shouldn't interrupt.
+ */
+/// Auto-mode sweep bounds: only items judged within the lookback are
+/// candidates (older mail deserves a human, not a late robot reply), and each
+/// tick answers at most a handful so a burst can't drain the LLM budget.
+const AUTO_MODE_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+const AUTO_MODE_MAX_PER_TICK = 5;
+/// A candidate whose draft keeps coming back empty is retried at most this
+/// many times (security review 2026-08-16: without a cap, one stuck item
+/// meant a fresh LLM call every 60s tick for the whole 6h lookback).
+/// In-memory by design — a restart resetting the count is harmless.
+const AUTO_MODE_MAX_DRAFT_ATTEMPTS = 3;
+const autoModeDraftAttempts = new Map<string, number>();
+
+export async function ensureAutoModeReplyNotification(
+  userId: string,
+  gmailId: string,
+  toAddr: string,
+): Promise<{ id: string; createdAt: Date } | null> {
+  try {
+    return await prisma.notification.create({
+      data: {
+        userId,
+        type: "email",
+        dedupeKey: `auto-mode-reply:${gmailId}`,
+        title: "Klorn replied for you",
+        message: `Auto-mode replied to ${toAddr} [${gmailId}]`,
+      },
+      select: { id: true, createdAt: true },
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) return null; // already replied to this email
+    throw err;
+  }
+}
+
+/**
  * Urgent-email bell notification — WINNER-ONLY and atomic. The read-based
  * notifiedGmailIds filter (parseNotifiedGmailIds) still does the primary
  * per-message dedup; this closes the residual concurrent-tick race on a single
@@ -646,6 +696,8 @@ async function runAutomations() {
             { phoneEscalationEnabled: true },
             // A user who enabled ONLY proactive actions still needs a tick.
             { proactiveActions: true },
+            // Auto-mode users need the sweep even with everything else off.
+            { attentionMode: "AUTO" },
           ],
         },
         take: BATCH_SIZE,
@@ -1269,6 +1321,134 @@ async function runUserCycle(
               captureError(err, {
                 tags: { scope: "automation.auto-reply" },
                 extra: { userId: config.userId, gmailId: email.gmailId },
+              });
+            }
+          }
+        }
+
+        // ─── Auto-MODE replies (ontology v2, guideline-driven) ────────────
+        // Klorn answers autoEligible QUEUE/MEETING items unattended when the
+        // user opted into attentionMode=AUTO. Double-flagged: TIER_V2_ENABLED
+        // (autoEligible rows exist at all) and AUTO_MODE_SEND_ENABLED (the
+        // send itself). Reuses the receipt-bound floor send — no new path.
+        if (
+          tierV2Enabled() &&
+          autoModeSendEnabled() &&
+          normalizeAttentionMode(config.attentionMode) === "AUTO" &&
+          planHasFeature(configUserPlan, "email_auto_reply", configUserRole)
+        ) {
+          const candidates = await prisma.attentionItem.findMany({
+            where: {
+              userId: config.userId,
+              source: "EMAIL",
+              status: "OPEN",
+              autoEligible: true,
+              tier: { in: ["QUEUE", "MEETING"] },
+              isManualOverride: false,
+              createdAt: { gte: new Date(Date.now() - AUTO_MODE_LOOKBACK_MS) },
+            },
+            orderBy: { createdAt: "desc" },
+            take: AUTO_MODE_MAX_PER_TICK,
+          });
+          const guideline = effectiveAutoReplyGuideline(config.autoReplyGuideline);
+          for (const item of candidates) {
+            try {
+              const email = await prisma.emailMessage.findFirst({
+                where: { id: item.sourceId, userId: config.userId },
+              });
+              if (!email) continue;
+              // Never double-answer one mail: an EmailRule reply or an
+              // earlier mode reply already claimed it.
+              const already = await prisma.notification.findFirst({
+                where: {
+                  userId: config.userId,
+                  dedupeKey: {
+                    in: [`auto-reply:${email.gmailId}`, `auto-mode-reply:${email.gmailId}`],
+                  },
+                },
+                select: { id: true },
+              });
+              if (already) continue;
+              // Refuse a malformed/crafted From BEFORE any LLM spend or
+              // ledger write — the floor's single-recipient guard would only
+              // reject it after the ledger already claimed "replied".
+              const toMatch = email.from.match(/<([^>]+)>/);
+              const toAddr = (toMatch ? toMatch[1] : email.from).trim();
+              if (!isSingleRecipient(toAddr)) {
+                console.warn(`[AUTOMATION] auto-mode skip: non-single recipient from ${item.id}`);
+                continue;
+              }
+              const attempts = autoModeDraftAttempts.get(item.id) ?? 0;
+              if (attempts >= AUTO_MODE_MAX_DRAFT_ATTEMPTS) continue;
+              const draft = await generateGuidelineReply(
+                { from: email.from, subject: email.subject, body: email.body || "" },
+                config.userId,
+                guideline,
+              );
+              if (!draft) {
+                autoModeDraftAttempts.set(item.id, attempts + 1);
+                continue;
+              }
+              autoModeDraftAttempts.delete(item.id);
+              // Race guard mirroring the rule sweep: the LLM took seconds —
+              // skip if the source row vanished (delete/reconcile).
+              const still = await prisma.emailMessage.findFirst({
+                where: { id: email.id },
+                select: { id: true },
+              });
+              if (!still) continue;
+              // Ledger BEFORE send — opposite of the rule sweep, deliberately.
+              // The unique dedupeKey is the cross-tick concurrency lock: an
+              // unattended DOUBLE-send is worse than a missed one.
+              const ledger = await ensureAutoModeReplyNotification(
+                config.userId,
+                email.gmailId,
+                toAddr,
+              );
+              if (!ledger) continue;
+              try {
+                await sendAutoReplyViaFloor(
+                  config.userId,
+                  toAddr,
+                  `Re: ${email.subject}`,
+                  draft,
+                  email.id,
+                );
+              } catch (sendErr) {
+                // The ledger must not lie: rewrite it as a failure record so
+                // the user is never told a reply went out when it didn't.
+                // No retry (at-most-once holds); the item stays OPEN for the
+                // human lane (security review 2026-08-16, HIGH).
+                await prisma.notification
+                  .update({
+                    where: { id: ledger.id },
+                    data: {
+                      title: "Auto-mode reply failed",
+                      message: `Auto-mode reply to ${toAddr} failed — the mail is still in your queue [${email.gmailId}]`,
+                    },
+                  })
+                  .catch((updateErr) =>
+                    console.warn(
+                      `[AUTOMATION] auto-mode failure-ledger update failed for ${item.id}`,
+                      updateErr,
+                    ),
+                  );
+                throw sendErr;
+              }
+              // Klorn handled it — resolve the item so the queue stays clean.
+              await prisma.attentionItem
+                .update({ where: { id: item.id }, data: { status: "RESOLVED" } })
+                .catch((err) =>
+                  console.warn(`[AUTOMATION] auto-mode resolve failed for ${item.id}`, err),
+                );
+            } catch (err) {
+              console.warn(
+                `[AUTOMATION] auto-mode reply failed for item ${item.id} (user ${config.userId})`,
+                err,
+              );
+              captureError(err, {
+                tags: { scope: "automation.auto-mode-reply" },
+                extra: { userId: config.userId, itemId: item.id },
               });
             }
           }
