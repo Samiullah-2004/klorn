@@ -334,6 +334,14 @@ struct MeetingContextWire: Codable, Sendable {
     let alternatives: [AlternativeSlot]?
 }
 
+/// GET /api/email/:id/sender-dossier — relationship context for the sender.
+struct SenderDossierWire: Codable, Sendable {
+    let summary: String
+    let openThreads: [String]
+    let lastPromise: String?
+    let emailCount: Int
+}
+
 // MARK: - Agent activity ("what Klorn did today")
 
 /// GET /api/automations/today-actions — the day's autonomous-agent receipt.
