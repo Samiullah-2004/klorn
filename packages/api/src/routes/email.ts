@@ -22,6 +22,7 @@ import { requireAppAccess, requireEntitled } from "../billing/entitlement-guard.
 import { planHasFeature } from "../billing/stripe.js";
 import { MULTI_INBOX_SYNC_ENABLED, providerInboxSelectorEnabled } from "../config.js";
 import { prisma } from "../db.js";
+import { isTier } from "../judge/tiers.js";
 import { getCachedInteractionNode } from "../learning/interaction-graph.js";
 import {
   getTrustScore,
@@ -1441,6 +1442,86 @@ export async function emailRoutes(app: FastifyInstance) {
       return { summarized: count };
     },
   );
+
+  // Ids of this user's single-sender PIN_TIER rules for `sender` — EXACT
+  // shape [sender] only, so multi-address rules authored via the generic
+  // /rules endpoint are never retargeted or deleted from the pin routes.
+  // Matching runs in JS (not a JSON path filter): the rule count per user is
+  // tiny, and exactness beats relying on Postgres array-containment shape.
+  async function pinnedRuleIds(uid: string, sender: string): Promise<string[]> {
+    const rules = await prisma.emailRule.findMany({
+      where: { userId: uid, actionType: "PIN_TIER" },
+      select: { id: true, conditions: true },
+    });
+    return rules
+      .filter((rule) => {
+        const from = (rule.conditions as { from?: unknown })?.from;
+        return (
+          Array.isArray(from) &&
+          from.length === 1 &&
+          typeof from[0] === "string" &&
+          from[0].toLowerCase() === sender
+        );
+      })
+      .map((rule) => rule.id);
+  }
+
+  // Resolve :id (db id or gmailId) to the mail's exact parsed sender address.
+  async function senderOfOwnedEmail(uid: string, id: string): Promise<string | null> {
+    const dbEmail = await prisma.emailMessage.findFirst({
+      where: { userId: uid, OR: [{ id }, { gmailId: id }] },
+      select: { from: true },
+    });
+    if (!dbEmail) return null;
+    return extractEmailAddress(dbEmail.from ?? "")?.toLowerCase() || null;
+  }
+
+  // POST /api/email/:id/pin-tier {tier} — "this sender is ALWAYS this lane".
+  // Replaces the sender's pin rule(s) atomically (delete-then-create in one
+  // transaction); the judge honors it at cascade rank 0 ("enforced, not
+  // predicted"). Delete-then-create also self-heals any duplicate rows a
+  // concurrent double-submit may have left behind. DELETE unpins.
+  app.post("/:id/pin-tier", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const uid = getUserId(request);
+    const { tier } = (request.body as { tier?: string }) || {};
+    if (!tier || !isTier(tier)) {
+      return reply.code(400).send({ error: "tier must be one of the known lanes." });
+    }
+    const sender = await senderOfOwnedEmail(uid, id);
+    if (!sender) return reply.code(404).send({ error: "Email not found" });
+
+    const stale = await pinnedRuleIds(uid, sender);
+    await prisma.$transaction([
+      ...(stale.length
+        ? [prisma.emailRule.deleteMany({ where: { id: { in: stale }, userId: uid } })]
+        : []),
+      prisma.emailRule.create({
+        data: {
+          userId: uid,
+          name: `Pin: ${sender}`,
+          conditions: { from: [sender] },
+          actionType: "PIN_TIER",
+          actionValue: tier,
+        },
+      }),
+    ]);
+    return { pinned: true, sender, tier };
+  });
+
+  // DELETE /api/email/:id/pin-tier — remove the sender's pin(s). deleteMany
+  // (not findFirst+delete) so an unpin always clears every matching row.
+  app.delete("/:id/pin-tier", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const uid = getUserId(request);
+    const sender = await senderOfOwnedEmail(uid, id);
+    if (!sender) return reply.code(404).send({ error: "Email not found" });
+    const stale = await pinnedRuleIds(uid, sender);
+    if (stale.length) {
+      await prisma.emailRule.deleteMany({ where: { id: { in: stale }, userId: uid } });
+    }
+    return { pinned: false, sender };
+  });
 
   // GET /api/email/:id/sender-dossier — relationship context for the mail's
   // sender ("why did this person write"). Cache-by-count inside the module:
