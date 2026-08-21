@@ -30,6 +30,7 @@ const FILTERS: Array<{ key: Filter; label: string }> = [
   { key: "REJECTED", label: "Rejected" },
   { key: "ALL", label: "All" },
 ];
+const TOP_N_SOURCES = 5;
 
 function formatDate(iso: string): string {
   try {
@@ -58,6 +59,7 @@ function WaitlistPageInner() {
   const [entries, setEntries] = useState<WaitlistEntry[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [filter, setFilter] = useState<Filter>("PENDING");
+  const [sourceFilter, setSourceFilter] = useState<string>("ALL");
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -75,6 +77,28 @@ function WaitlistPageInner() {
       setLoading(false);
     }
   }, [filter, toast]);
+
+  const sourceCounts = entries.reduce<Record<string, number>>((acc, entry) => {
+    const key = entry.source ?? "Unknown";
+    acc[key] = (acc[key] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  const topSources = Object.entries(sourceCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, TOP_N_SOURCES)
+    .map(([key]) => key);
+
+  const otherCount = Object.entries(sourceCounts)
+    .filter(([key]) => !topSources.includes(key))
+    .reduce((sum, [, count]) => sum + count, 0);
+
+  const visibleEntries =
+    sourceFilter === "ALL"
+      ? entries
+      : sourceFilter === "Other"
+        ? entries.filter((entry) => !topSources.includes(entry.source ?? "Unknown"))
+        : entries.filter((entry) => (entry.source ?? "Unknown") === sourceFilter);
 
   useEffect(() => {
     load();
@@ -160,7 +184,10 @@ function WaitlistPageInner() {
               <button
                 key={f.key}
                 type="button"
-                onClick={() => setFilter(f.key)}
+                onClick={() => {
+                  setFilter(f.key);
+                  setSourceFilter("ALL");
+                }}
                 className={`ease-strong rounded-xl border px-4 py-3 text-left transition duration-150 active:scale-[0.97] ${
                   isActive
                     ? "panel-elevated border-accent-muted bg-sky-50 text-ink"
@@ -174,16 +201,38 @@ function WaitlistPageInner() {
           })}
         </section>
 
+        {topSources.length > 0 && (
+          <section className="mb-6 flex flex-wrap items-center gap-3">
+            <label htmlFor="source-filter" className="text-sm text-ink-mid">
+              Source:
+            </label>
+            <select
+              id="source-filter"
+              value={sourceFilter}
+              onChange={(e) => setSourceFilter(e.target.value)}
+              className="rounded-lg border border-line bg-surface-panel/70 px-3 py-1.5 text-sm text-ink"
+            >
+              <option value="ALL">All ({entries.length})</option>
+              {topSources.map((s) => (
+                <option key={s} value={s}>
+                  {s} ({sourceCounts[s]})
+                </option>
+              ))}
+              {otherCount > 0 && <option value="Other">Other ({otherCount})</option>}
+            </select>
+          </section>
+        )}
+
         {loading ? (
           <p className="text-sm text-ink-dim">Loading...</p>
-        ) : entries.length === 0 ? (
+        ) : visibleEntries.length === 0 ? (
           <p className="panel-elevated rounded-2xl border border-line/70 bg-surface-panel p-6 text-sm text-ink-mid">
             No requests in this state.
           </p>
         ) : (
           <section className="panel-elevated overflow-hidden rounded-2xl border border-line/70 bg-surface-panel">
             <ul className="divide-y divide-line-soft">
-              {entries.map((entry) => (
+              {visibleEntries.map((entry) => (
                 <li key={entry.id} className="row-wash p-4 md:p-5">
                   <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
                     <div className="flex min-w-0 items-start gap-3">
